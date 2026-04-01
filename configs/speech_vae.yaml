@@ -1,0 +1,58 @@
+# ── Audio ──────────────────────────────────────────────────────────
+sample_rate: 24000
+frame_rate: 12.5
+channels: 1
+clip_seconds: 2.0          # shorter clips → bigger batch → stable GAN training
+                           # paper uses 12s but that requires 64-GPU setup
+
+# ── VAE Architecture ───────────────────────────────────────────────
+encoder_base_channels: 64
+encoder_strides: [6, 5, 4, 4, 4]     # total downsample = 1920
+latent_dim: 32
+transformer_hidden: 512
+transformer_layers: 8
+transformer_heads: 8
+transformer_ffn_dim: 2048
+transformer_sliding_window: 125       # frames — 10s at 12.5Hz (paper Table 13: "Transformer context: 10s")
+
+# ── Training ───────────────────────────────────────────────────────
+batch_size: 8                  # safe for A100 40GB with 2s clips
+grad_accumulation: 8           # effective batch = 64
+learning_rate: 8.0e-4
+disc_learning_rate: 3.0e-4
+betas: [0.8, 0.99]          # ⚠️ not stated in paper for VAE; inferred from EnCodec/DAC convention
+lr_schedule: cosine
+max_steps: 500000
+warmup_steps: 5000
+grad_clip_norm: 1000.0
+
+# ── Loss weights ───────────────────────────────────────────────────
+lambda_kl: 0.01
+lambda_adv: 1.0
+lambda_feat: 5.0
+lambda_distil: 25.0
+lambda_recon: 0.0             # speech: NO reconstruction loss
+
+# ── WavLM ──────────────────────────────────────────────────────────
+wavlm_model: "microsoft/wavlm-large"
+wavlm_layer: 7                # which hidden layer to distil from (0-indexed)
+wavlm_input_sr: 16000         # WavLM only accepts 16kHz
+
+# ── Checkpointing ──────────────────────────────────────────────────
+save_every: 10000
+eval_every: 5000
+keep_last_n: 5
+output_dir: "./checkpoints/speech_vae"
+
+# ── Data ───────────────────────────────────────────────────────────
+datasets:
+  - name: libritts_r
+    hf_id: "mythicinfinity/libritts_r"
+    config: "all"
+    split: "train.clean.360+train.clean.100+train.other.500"
+    weight: 1.0
+  - name: voxpopuli
+    hf_id: "facebook/voxpopuli"
+    config: "en"
+    split: "train"
+    weight: 0.5
