@@ -885,4 +885,207 @@ After bottleneck:  [B, 32,  25]  (μ or z sampled)
 
 ---
 
-*Next section: the VAE bottleneck and reparameterisation.*
+---
+
+## 5. VAE Bottleneck & Reparameterisation
+
+This section covers the bottleneck that converts the encoder's hidden state into a Gaussian
+distribution and samples from it — the core element that makes this a VAE rather than a plain
+autoencoder or VQ-VAE.
+
+### Why Gaussian?
+
+The downstream CALM consistency head operates by:
+1. Sampling pure noise: `ε ~ N(0, I)` in latent space
+2. Denoising it in one step to produce a plausible next latent frame
+
+For this to work, the VAE's aggregate posterior must be close to `N(0, I)`. The KL divergence
+term in the loss enforces this. The smoother and more Gaussian the latent space, the easier the
+consistency head's denoising task.
+
+---
+
+### Bottleneck code — append to `models/vae.py`
+
+```python
+# ─────────────────────────────────────────────────────────────────────────────
+# VAE Bottleneck
+# ─────────────────────────────────────────────────────────────────────────────
+
+class VAEBottleneck(nn.Module):
+    """
+    Converts encoder hidden states [B, encoder_dim, T] into:
+      - μ (mean):    [B, latent_dim, T]
+      - logvar:      [B, latent_dim, T]
+      - z (sample):  [B, latent_dim, T]  via reparameterisation
+
+    At inference (CALM backbone uses the encoder):
+      - Use z = μ  (deterministic, no noise)
+      - Or z = μ + sqrt(τ) · σ · ε  for temperature-τ sampling
+    """
+
+    def __init__(self, encoder_dim: int = 512, latent_dim: int = 32):
+        super().__init__()
+        self.mu_proj     = nn.Linear(encoder_dim, latent_dim)
+        self.logvar_proj = nn.Linear(encoder_dim, latent_dim)
+
+    def forward(self, h: torch.Tensor, sample: bool = True,
+                temperature: float = 1.0):
+        """
+        h:         [B, encoder_dim, T]   — output of Encoder
+        sample:    True during training; False for deterministic encoding
+        Returns:
+          z:       [B, latent_dim, T]
+          mu:      [B, latent_dim, T]
+          logvar:  [B, latent_dim, T]
+        """
+        # h is channels-first; project along channel dim
+        h_t = h.transpose(1, 2)                   # [B, T, encoder_dim]
+        mu     = self.mu_proj(h_t).transpose(1, 2)      # [B, latent_dim, T]
+        logvar = self.logvar_proj(h_t).transpose(1, 2)  # [B, latent_dim, T]
+
+        # Clamp logvar for numerical stability (avoids exp overflow)
+        logvar = logvar.clamp(-30.0, 20.0)
+
+        if sample:
+            std = torch.exp(0.5 * logvar)
+            eps = torch.randn_like(std)
+            z   = mu + math.sqrt(temperature) * std * eps
+        else:
+            z = mu   # deterministic — used for CALM backbone at inference
+
+        return z, mu, logvar
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full VAE (Encoder + Bottleneck + Decoder in one module)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SpeechVAE(nn.Module):
+    """
+    Full causal Speech VAE-GAN generator.
+    Encoder → Bottleneck → Decoder.
+
+    Usage:
+        vae = SpeechVAE()
+        z, mu, logvar, recon = vae(audio)    # training
+        z, mu, logvar, _     = vae(audio, decode=False)  # encode only
+    """
+
+    def __init__(self,
+                 base_channels: int = 64,
+                 strides: list[int] | None = None,
+                 latent_dim: int = 32,
+                 transformer_dim: int = 512,
+                 transformer_layers: int = 8,
+                 transformer_heads: int = 8,
+                 transformer_ffn: int = 2048,
+                 sliding_window: int = 250):
+        super().__init__()
+        if strides is None:
+            strides = [6, 5, 4, 4, 4]
+
+        self.encoder = Encoder(
+            base_channels=base_channels,
+            strides=strides,
+            transformer_dim=transformer_dim,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            transformer_ffn=transformer_ffn,
+            sliding_window=sliding_window,
+        )
+        self.bottleneck = VAEBottleneck(
+            encoder_dim=self.encoder.out_channels,
+            latent_dim=latent_dim,
+        )
+        self.decoder = Decoder(
+            latent_dim=latent_dim,
+            base_channels=base_channels,
+            strides=strides,
+            transformer_dim=transformer_dim,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            transformer_ffn=transformer_ffn,
+            sliding_window=sliding_window,
+        )
+
+    def encode(self, audio: torch.Tensor,
+               sample: bool = True,
+               temperature: float = 1.0):
+        """
+        audio: [B, 1, T_audio]
+        Returns z, mu, logvar each [B, latent_dim, T_latent]
+        """
+        h                 = self.encoder(audio)
+        z, mu, logvar     = self.bottleneck(h, sample=sample,
+                                            temperature=temperature)
+        return z, mu, logvar
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        """z: [B, latent_dim, T_latent]  →  [B, 1, T_audio]"""
+        return self.decoder(z)
+
+    def forward(self, audio: torch.Tensor, decode: bool = True,
+                sample: bool = True, temperature: float = 1.0):
+        z, mu, logvar = self.encode(audio, sample=sample,
+                                    temperature=temperature)
+        recon = self.decode(z) if decode else None
+        return z, mu, logvar, recon
+```
+
+---
+
+### KL divergence loss
+
+```python
+def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """
+    KL divergence from posterior N(μ, σ²) to prior N(0, I).
+    Returns scalar mean over batch and time.
+
+    KL = -0.5 * sum(1 + logvar - mu² - exp(logvar))
+    """
+    return -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp()).mean()
+```
+
+With `λ_KL = 0.01`, this term is kept small so reconstruction quality is prioritised. If you
+notice the latent space is not well-structured (consistency head struggles at inference), try
+gradually annealing `λ_KL` from 0 to 0.01 over the first 50k steps (KL annealing).
+
+---
+
+### Inference encoding (CALM backbone)
+
+At inference time the CALM backbone calls the encoder deterministically — no noise, just `μ`:
+
+```python
+# During CALM training and inference — always deterministic encoding
+with torch.no_grad():
+    z, mu, logvar = vae.encode(audio, sample=False)
+    # z == mu here — used as ground-truth latent targets for the consistency head
+```
+
+Temperature sampling in CALM happens in the **consistency head**, not the VAE bottleneck.
+
+---
+
+### Parameter count sanity check
+
+```python
+from models.vae import SpeechVAE
+
+vae = SpeechVAE()
+total = sum(p.numel() for p in vae.parameters())
+enc   = sum(p.numel() for p in vae.encoder.parameters())
+dec   = sum(p.numel() for p in vae.decoder.parameters())
+bn    = sum(p.numel() for p in vae.bottleneck.parameters())
+print(f"Encoder:    {enc/1e6:.1f}M")
+print(f"Bottleneck: {bn/1e6:.3f}M")
+print(f"Decoder:    {dec/1e6:.1f}M")
+print(f"Total VAE:  {total/1e6:.1f}M")
+# Expected: ~8–10M each for enc/dec, ~20M total
+```
+
+---
+
+*Next section: the discriminators used for adversarial training.*
