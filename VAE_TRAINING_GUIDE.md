@@ -148,4 +148,168 @@ CALM Speech VAE
 
 ---
 
-*Next section: environment setup and dependency installation.*
+---
+
+## 2. Environment Setup
+
+### Hardware requirements
+
+| Component | Minimum           | Recommended (paper)    |
+|-----------|-------------------|------------------------|
+| GPU       | A100 40GB (×1)    | 8–48× H100             |
+| RAM       | 64 GB             | 256 GB                 |
+| Storage   | 500 GB SSD        | 2–4 TB NVMe            |
+| CUDA      | 11.8+             | 12.1+                  |
+
+A single A100 40GB is sufficient for the VAE training stage. Expect **5–10 days** to reach
+convergence (~300K–500K steps). The CALM backbone (Stage 2, 302M params) also fits on one A100
+with gradient checkpointing.
+
+---
+
+### Python environment
+
+```bash
+# Create a clean conda environment
+conda create -n calm python=3.10 -y
+conda activate calm
+
+# Install PyTorch with CUDA 12.1 (adjust cuda version to match your driver)
+pip install torch==2.3.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Core audio / ML dependencies
+pip install \
+    transformers==4.44.2 \
+    datasets==2.21.0 \
+    accelerate==0.33.0 \
+    torchaudio==2.3.1 \
+    einops==0.8.0 \
+    librosa==0.10.2 \
+    soundfile==0.12.1 \
+    webdataset==0.2.100 \
+    wandb \
+    tqdm \
+    numpy \
+    scipy
+
+# EnCodec (for MS-STFT discriminator reference)
+pip install encodec
+
+# audiocraft (for SEANet modules, loss balancer, MSSTFTD)
+pip install -U audiocraft
+
+# WavLM / HuggingFace
+pip install transformers accelerate
+```
+
+---
+
+### Project layout
+
+```
+calm-training/
+├── VAE_TRAINING_GUIDE.md          ← this file
+├── train_vae.py                   ← main training entry point
+├── configs/
+│   └── speech_vae.yaml            ← all hyperparameters
+├── models/
+│   ├── __init__.py
+│   ├── vae.py                     ← encoder, bottleneck, decoder
+│   ├── discriminators.py          ← MS-STFT, MPD, MSD
+│   └── wavlm_distill.py           ← WavLM teacher + distillation loss
+├── data/
+│   ├── __init__.py
+│   └── speech_dataset.py          ← HuggingFace dataset loader
+├── losses/
+│   ├── __init__.py
+│   └── vae_losses.py              ← KL, adversarial, feature matching
+└── utils/
+    ├── __init__.py
+    └── normalise.py               ← compute + save latent stats
+```
+
+---
+
+### Verify GPU access
+
+```python
+import torch
+print(torch.cuda.is_available())       # True
+print(torch.cuda.get_device_name(0))   # NVIDIA A100-SXM4-40GB
+print(torch.cuda.get_device_properties(0).total_memory / 1e9)  # ~40.0 GB
+
+# Enable TF32 — A100-native, ~2× faster than fp32 with no quality loss
+# Do NOT use fp16 AMP for audio GANs — known to cause NaN
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+```
+
+---
+
+### configs/speech_vae.yaml
+
+```yaml
+# ── Audio ──────────────────────────────────────────────────────────
+sample_rate: 24000
+frame_rate: 12.5
+channels: 1
+clip_seconds: 2.0          # shorter clips → bigger batch → stable GAN training
+                           # paper uses 12s but that requires 64-GPU setup
+
+# ── VAE Architecture ───────────────────────────────────────────────
+encoder_base_channels: 64
+encoder_strides: [6, 5, 4, 4, 4]     # total downsample = 1920
+latent_dim: 32
+transformer_hidden: 512
+transformer_layers: 8
+transformer_heads: 8
+transformer_ffn_dim: 2048
+transformer_sliding_window: 250       # frames (~20s at 12.5Hz)
+
+# ── Training ───────────────────────────────────────────────────────
+batch_size: 8                  # safe for A100 40GB with 2s clips
+grad_accumulation: 8           # effective batch = 64
+learning_rate: 8.0e-4
+disc_learning_rate: 3.0e-4
+betas: [0.8, 0.99]
+lr_schedule: cosine
+max_steps: 500000
+warmup_steps: 5000
+grad_clip_norm: 1000.0
+
+# ── Loss weights ───────────────────────────────────────────────────
+lambda_kl: 0.01
+lambda_adv: 1.0
+lambda_feat: 5.0
+lambda_distil: 25.0
+lambda_recon: 0.0             # speech: NO reconstruction loss
+
+# ── WavLM ──────────────────────────────────────────────────────────
+wavlm_model: "microsoft/wavlm-large"
+wavlm_layer: 7                # which hidden layer to distil from (0-indexed)
+wavlm_input_sr: 16000         # WavLM only accepts 16kHz
+
+# ── Checkpointing ──────────────────────────────────────────────────
+save_every: 10000
+eval_every: 5000
+keep_last_n: 5
+output_dir: "./checkpoints/speech_vae"
+
+# ── Data ───────────────────────────────────────────────────────────
+datasets:
+  - name: libritts_r
+    hf_id: "mythicinfinity/libritts_r"
+    config: "all"
+    split: "train.clean.360+train.clean.100+train.other.500"
+    weight: 1.0
+  - name: voxpopuli
+    hf_id: "facebook/voxpopuli"
+    config: "en"
+    split: "train"
+    weight: 0.5
+```
+
+---
+
+*Next section: loading and preprocessing the datasets.*
