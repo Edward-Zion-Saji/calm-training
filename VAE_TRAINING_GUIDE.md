@@ -2441,4 +2441,218 @@ wandb.log({
 
 ---
 
-*Next section: A100 40GB specific tips and troubleshooting common failure modes.*
+---
+
+## 12. A100 40GB Tips & Troubleshooting
+
+### Memory budget
+
+At batch size 8, 2-second clips (48,000 samples at 24kHz), here is the approximate VRAM usage:
+
+| Component | VRAM |
+|---|---|
+| VAE generator (~20M params, fp32) | ~0.3 GB |
+| VAE activations + gradients | ~8 GB |
+| Discriminators (~150M params, fp32) | ~2.3 GB |
+| Discriminator activations + gradients | ~6 GB |
+| WavLM-Large frozen (316M, fp32) | ~1.2 GB |
+| WavLM activations (no grad) | ~1 GB |
+| Optimiser states (Adam, 2× param) | ~3 GB |
+| **Total** | **~22 GB** |
+
+This leaves ~18 GB of headroom on a 40GB A100. You can safely increase batch size to 16 with
+gradient checkpointing disabled. With 12-second clips (as in the paper), memory scales linearly
+with clip length — use gradient accumulation at batch size 4 with 12s clips to simulate batch 64.
+
+---
+
+### Configuration for 12-second clips (paper-equivalent, single A100)
+
+```yaml
+# For 12-second clips on A100 40GB:
+clip_seconds: 12.0
+batch_size: 4              # 4 × 12s = 48s per step
+grad_accumulation: 16      # effective batch = 64 — matches paper
+```
+
+```python
+# Enable gradient checkpointing on both Transformer stacks
+# (saves ~3× activation memory, ~30% slower)
+from torch.utils.checkpoint import checkpoint_wrapper
+
+vae.encoder.transformer.blocks = nn.ModuleList([
+    checkpoint_wrapper(b) for b in vae.encoder.transformer.blocks
+])
+vae.decoder.transformer.blocks = nn.ModuleList([
+    checkpoint_wrapper(b) for b in vae.decoder.transformer.blocks
+])
+```
+
+---
+
+### Do NOT use fp16 AMP
+
+This is a common mistake that wastes days of training:
+
+```python
+# ❌ DO NOT DO THIS — causes NaN in audio GANs
+scaler = torch.cuda.amp.GradScaler()
+with torch.autocast("cuda", dtype=torch.float16):
+    ...
+
+# ✅ USE THIS INSTEAD — TF32 is A100-native, ~2× faster than fp32, no NaN
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+# Train in full fp32 — TF32 kicks in automatically for matmuls/convs
+```
+
+BF16 is a safer alternative to FP16 if you want mixed precision, but the EVA-GAN paper found
+it caused mild quality degradation on high-frequency content. TF32 is the best choice on A100.
+
+---
+
+### Troubleshooting common failure modes
+
+#### ❌ Discriminator loss collapses to 0 immediately
+
+The discriminator has learned to perfectly distinguish real from fake before the generator
+has a chance to improve.
+
+**Fixes:**
+- Reduce `disc_learning_rate` (try 1e-4 instead of 3e-4)
+- Add noise to real audio inputs to the discriminator: `real + 0.01 * torch.randn_like(real)`
+- Delay discriminator training — skip disc update for first 1000 steps
+
+#### ❌ Generator loss diverges (NaN or inf)
+
+Usually caused by gradient explosion through the Transformer attention.
+
+**Fixes:**
+- Lower learning rate to 1e-4
+- Ensure `grad_clip_norm = 1000.0` is applied every step
+- Check that `logvar.clamp(-30, 20)` is in the bottleneck (already in the code)
+- Verify `torch.backends.cuda.matmul.allow_tf32 = True` is set (FP32 matmuls without TF32 can overflow in rare edge cases)
+
+#### ❌ WavLM distillation loss is not decreasing
+
+**Fixes:**
+- Verify resampling to 16kHz is happening correctly before WavLM
+- Check that WavLM's forward pass is not receiving silence (all-zero arrays)
+- Try a different WavLM layer (`wavlm_layer: 6` is used in Mimi, `wavlm_layer: 9` is richer)
+- Increase `lambda_distil` to 50 temporarily to force the latent space toward WavLM structure
+
+#### ❌ Reconstructions are intelligible but sound metallic / buzzy
+
+The discriminator is not adequately penalising high-frequency artifacts.
+
+**Fixes:**
+- Ensure MS-STFT discriminator is active (it handles high-frequency structure best)
+- Increase `lambda_feat` to 10 to strengthen perceptual guidance
+- Train for more steps — metallic artifacts typically resolve by 200k–300k steps
+
+#### ❌ GPU out of memory
+
+```python
+# Immediate fixes in order of impact:
+# 1. Reduce clip length
+clip_seconds: 1.0   # instead of 2.0 — largest single factor
+
+# 2. Enable gradient checkpointing (see above)
+
+# 3. Reduce batch size + increase accumulation
+batch_size: 2
+grad_accumulation: 32   # effective batch stays at 64
+
+# 4. Clear discriminator cache between steps
+torch.cuda.empty_cache()
+
+# 5. Run WavLM in chunks (if clip length is long)
+# Process WavLM in 5s windows and average features
+```
+
+#### ❌ Latent stats show std >> 1 after training
+
+KL regularisation is too weak — the posterior is not close enough to `N(0, I)`.
+
+**Fixes:**
+- Increase `lambda_kl` to 0.1 and retrain (or fine-tune) for 50k steps
+- Alternatively, just use a stronger normalisation: subtract mean, divide by std (already done in `normalise_latents`) — this is a post-hoc fix that works even if the distribution is not perfectly Gaussian
+
+---
+
+### Recommended training schedule for A100 40GB
+
+```
+Phase 1 (0–50k steps):
+  clip_seconds: 2.0, batch: 8, accum: 8, lr: 8e-4
+  → Focus on getting basic reconstruction and distillation working
+  → Watch: distil_loss should drop from ~0.9 to ~0.3
+
+Phase 2 (50k–200k steps):
+  clip_seconds: 4.0, batch: 4, accum: 16, lr: 4e-4
+  → Increase clip length for better temporal coherence
+  → Watch: PESQ > 2.0, STOI > 0.85
+
+Phase 3 (200k–500k steps):
+  clip_seconds: 8.0, batch: 2, accum: 32, lr: 2e-4
+  → Long-context refinement
+  → Watch: PESQ ≈ 2.4, STOI ≈ 0.90  (paper-level)
+```
+
+Using shorter clips in early phases is actually better for GAN training stability — the
+discriminator receives cleaner gradients and the generator converges faster on short patterns
+before being challenged with longer temporal coherence.
+
+---
+
+### Quick-start command
+
+```bash
+# 1. Install dependencies
+conda activate calm
+pip install torch torchaudio transformers datasets accelerate einops \
+    librosa soundfile wandb tqdm pesq pystoi
+
+# 2. Start training (2-second clips, batch 8, no W&B)
+python train_vae.py --config configs/speech_vae.yaml --no_wandb
+
+# 3. Resume from checkpoint
+python train_vae.py --config configs/speech_vae.yaml \
+    --resume checkpoints/speech_vae/latest.pt
+
+# 4. Compute latent stats after training
+python -m utils.normalise \
+    --vae_ckpt checkpoints/speech_vae/vae_final.pt \
+    --config   configs/speech_vae.yaml \
+    --out      checkpoints/speech_vae/latent_stats.pt
+
+# 5. Evaluate
+python -c "
+from models.vae import SpeechVAE
+import torch
+vae = SpeechVAE()
+vae.load_state_dict(torch.load('checkpoints/speech_vae/vae_final.pt'))
+from utils.evaluate import evaluate_vae
+evaluate_vae(vae)
+"
+```
+
+---
+
+## What comes next — Stage 2: CALM Backbone
+
+Once your VAE is trained and latent stats are computed, you have everything needed for Stage 2.
+The inputs to CALM backbone training are:
+
+1. `vae_final.pt` — frozen encoder to produce latent targets
+2. `latent_stats.pt` — mean/std for normalisation
+3. Text transcripts aligned to audio (for TTS: text prefix, or inner monologue)
+
+Stage 2 trains a 302M causal Transformer backbone + 10M consistency head to autoregressively
+predict normalised VAE latent frames conditioned on text. That guide will be added here in a
+future commit.
+
+---
+
+*References: Rouard et al. 2025 (arXiv:2509.06926) · Défossez et al. 2024 (Moshi/Mimi) ·
+Chen et al. 2021 (WavLM) · Evans et al. 2024 (Stable Audio Open) · Kumar et al. 2023 (DAC)*
