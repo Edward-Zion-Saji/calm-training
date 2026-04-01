@@ -2257,4 +2257,188 @@ not close enough to `N(0, I)`. Increase `λ_KL` or train longer.
 
 ---
 
-*Next section: evaluation metrics and checkpointing strategy.*
+---
+
+## 11. Evaluation, Checkpointing & Metrics
+
+### Metrics used in the paper
+
+The CALM paper evaluates the speech VAE against Mimi (8-RVQ) on four metrics:
+
+| Metric | What it measures | Higher is better? | Paper result (VAE vs Mimi) |
+|--------|-----------------|-------------------|---------------------------|
+| **MOSNet** | Predicted Mean Opinion Score (audio quality 1–5) | ↑ | 3.15 vs 3.11 — on par |
+| **ABX** | Phoneme discriminability (% error on minimal pairs) | ↓ lower = better | 8.1% vs 9.4% — VAE wins |
+| **PESQ** | Perceptual speech quality (telephony standard) | ↑ | 2.42 vs 2.13 — VAE wins |
+| **STOI** | Short-Time Objective Intelligibility (0–1) | ↑ | 0.90 vs 0.87 — VAE wins |
+
+The VAE is **better than Mimi** on three of four metrics and matches on MOSNet.
+
+---
+
+### Evaluation script
+
+```python
+"""
+Evaluate a trained VAE by encoding and decoding a test set,
+then computing PESQ, STOI, and logging audio samples to W&B.
+
+pip install pesq pystoi
+"""
+
+import torch
+import torchaudio
+import torchaudio.transforms as T
+import numpy as np
+from pesq import pesq
+from pystoi import stoi
+from datasets import load_dataset
+from models.vae import SpeechVAE
+
+
+def evaluate_vae(vae: SpeechVAE, n_samples: int = 100,
+                 sample_rate: int = 24_000, device: str = "cuda"):
+    vae.eval()
+    vae = vae.to(device)
+
+    # Load LibriTTS-R test-clean for evaluation
+    ds = load_dataset("mythicinfinity/libritts_r", "clean",
+                      split="test.clean", streaming=False)
+
+    pesq_scores, stoi_scores = [], []
+
+    resample_to_16k = T.Resample(sample_rate, 16_000)
+
+    with torch.no_grad():
+        for i, item in enumerate(ds):
+            if i >= n_samples:
+                break
+
+            # Load audio
+            waveform = torch.tensor(item["audio"]["array"],
+                                    dtype=torch.float32)
+            orig_sr  = item["audio"]["sampling_rate"]
+
+            # Resample to 24kHz if needed
+            if orig_sr != sample_rate:
+                waveform = T.Resample(orig_sr, sample_rate)(waveform)
+
+            # Normalise
+            peak = waveform.abs().max()
+            if peak > 0:
+                waveform = waveform / peak
+
+            # Pad to nearest multiple of stride product (1920)
+            stride_product = 1920
+            pad = (stride_product - waveform.shape[-1] % stride_product) % stride_product
+            waveform_padded = torch.nn.functional.pad(waveform, (0, pad))
+
+            audio_in = waveform_padded.unsqueeze(0).unsqueeze(0).to(device)  # [1,1,T]
+
+            # Encode + decode
+            z, mu, logvar, recon = vae(audio_in, sample=False)
+            recon = recon.squeeze().cpu()
+
+            # Trim to original length
+            recon = recon[:waveform.shape[-1]]
+            ref   = waveform[:waveform.shape[-1]]
+
+            # Downsample to 16kHz for PESQ (PESQ only supports 8/16kHz)
+            ref_16k   = resample_to_16k(ref.unsqueeze(0)).squeeze().numpy()
+            recon_16k = resample_to_16k(recon.unsqueeze(0)).squeeze().numpy()
+
+            # Clip to [-1, 1] for metrics
+            ref_16k   = np.clip(ref_16k,   -1, 1)
+            recon_16k = np.clip(recon_16k, -1, 1)
+
+            # PESQ (wideband, 16kHz)
+            try:
+                p = pesq(16_000, ref_16k, recon_16k, "wb")
+                pesq_scores.append(p)
+            except Exception:
+                pass
+
+            # STOI
+            s = stoi(ref_16k, recon_16k, 16_000, extended=False)
+            stoi_scores.append(s)
+
+    results = {
+        "pesq_mean": float(np.mean(pesq_scores)) if pesq_scores else 0.0,
+        "pesq_std":  float(np.std(pesq_scores))  if pesq_scores else 0.0,
+        "stoi_mean": float(np.mean(stoi_scores)),
+        "stoi_std":  float(np.std(stoi_scores)),
+        "n_samples": n_samples,
+    }
+
+    print(f"PESQ: {results['pesq_mean']:.3f} ± {results['pesq_std']:.3f}  "
+          f"(paper: 2.42)")
+    print(f"STOI: {results['stoi_mean']:.3f} ± {results['stoi_std']:.3f}  "
+          f"(paper: 0.90)")
+    return results
+```
+
+---
+
+### Checkpointing strategy
+
+```
+checkpoints/speech_vae/
+├── ckpt_0010000.pt    ← full checkpoint (VAE + disc + optimisers)
+├── ckpt_0020000.pt
+├── ckpt_0050000.pt
+├── ckpt_0100000.pt
+├── ...
+├── ckpt_0500000.pt
+├── latest.pt          ← symlink to most recent full checkpoint
+└── vae_final.pt       ← VAE weights only (for Stage 2 CALM training)
+```
+
+**Full checkpoints** include discriminator and optimiser states — use these to resume training.
+**`vae_final.pt`** is the VAE-only weights — this is the file Stage 2 loads.
+
+---
+
+### Training milestones — what to expect on A100 40GB
+
+| Step | Expected state | Action |
+|------|---------------|--------|
+| 0–5k | Loss unstable, GAN not converged | Normal — wait |
+| 5k–20k | Reconstruction audible but metallic | Distillation loss should be dropping |
+| 50k | Intelligible speech, some artifacts | Check PESQ > 1.5 |
+| 100k | Clearly intelligible, naturalness improving | PESQ > 1.8 |
+| 200k | Good quality, comparable to EnCodec | PESQ > 2.0, STOI > 0.85 |
+| 500k | Paper-level quality | PESQ ≈ 2.4, STOI ≈ 0.90 |
+
+Run `evaluate_vae()` every 50k steps and log to W&B. If STOI drops below 0.7 at 50k steps,
+something is wrong — check the WavLM distillation loss is decreasing.
+
+---
+
+### W&B logging — what to track
+
+```python
+# Key metrics to log every step:
+wandb.log({
+    "loss/total_gen":  ...,   # Total generator loss
+    "loss/disc":       ...,   # Discriminator loss — should stay ~0.5–1.0
+    "loss/kl":         ...,   # KL term — should be small (~0.01–0.1)
+    "loss/distil":     ...,   # WavLM distil — most important, should decrease steadily
+    "loss/feat":       ...,   # Feature matching
+    "loss/adv_gen":    ...,   # Generator adversarial component
+    "train/kl_weight": ...,   # Current λ_KL after annealing
+    "train/lr_gen":    ...,   # Learning rate
+})
+
+# Key metrics to log every eval_every steps:
+wandb.log({
+    "eval/pesq":       ...,
+    "eval/stoi":       ...,
+    # Log a few audio reconstruction samples
+    "audio/original":    wandb.Audio(ref_np,   sample_rate=24000),
+    "audio/reconstructed": wandb.Audio(recon_np, sample_rate=24000),
+})
+```
+
+---
+
+*Next section: A100 40GB specific tips and troubleshooting common failure modes.*
