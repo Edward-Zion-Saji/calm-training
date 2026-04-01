@@ -109,16 +109,29 @@ def apply_rope(q: torch.Tensor, k: torch.Tensor,
     return q, k
 
 
+class LayerScale(nn.Module):
+    """Per-channel learnable scale — Moshi paper: init=0.01 for training stability."""
+    def __init__(self, dim: int, init: float = 0.01):
+        super().__init__()
+        self.scale = nn.Parameter(torch.full((dim,), init))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale
+
+
 class CausalTransformerBlock(nn.Module):
-    """Single causal Transformer layer with RoPE and sliding window mask."""
+    """
+    Single causal Transformer layer with RoPE, sliding-window mask, and LayerScale.
+    LayerScale (Moshi paper Section 3.3.1): init=0.01 for training stability.
+    """
 
     def __init__(self, dim: int, heads: int, ffn_dim: int,
-                 sliding_window: int = 125, dropout: float = 0.0):  # 10s at 12.5Hz per Table 13
+                 sliding_window: int = 125, dropout: float = 0.0,
+                 layer_scale_init: float = 0.01):
         super().__init__()
         assert dim % heads == 0
-        self.heads      = heads
-        self.head_dim   = dim // heads
-        self.window     = sliding_window
+        self.heads    = heads
+        self.head_dim = dim // heads
+        self.window   = sliding_window
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -136,12 +149,14 @@ class CausalTransformerBlock(nn.Module):
             nn.Dropout(dropout),
         )
         self.rope = RotaryEmbedding(self.head_dim)
+        # LayerScale after attention and FFN (Moshi paper init=0.01)
+        self.ls1 = LayerScale(dim, init=layer_scale_init)
+        self.ls2 = LayerScale(dim, init=layer_scale_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, D]
         B, T, D = x.shape
 
-        # Self-attention with causal + sliding-window mask
         h = self.norm1(x)
         Q = self.q_proj(h).view(B, T, self.heads, self.head_dim).transpose(1, 2)
         K = self.k_proj(h).view(B, T, self.heads, self.head_dim).transpose(1, 2)
@@ -150,21 +165,19 @@ class CausalTransformerBlock(nn.Module):
         cos, sin = self.rope(T, x.device)
         Q, K = apply_rope(Q, K, cos, sin)
 
-        # Build causal mask restricted to sliding window
         mask = torch.full((T, T), float("-inf"), device=x.device)
         for i in range(T):
             start = max(0, i - self.window + 1)
             mask[i, start: i + 1] = 0.0
-        mask = mask.unsqueeze(0).unsqueeze(0)   # [1,1,T,T]
+        mask = mask.unsqueeze(0).unsqueeze(0)
 
         scale = math.sqrt(self.head_dim)
         attn  = (Q @ K.transpose(-2, -1)) / scale + mask
         attn  = attn.softmax(dim=-1)
-        out   = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
-        x     = x + self.o_proj(out)
+        attn_out = (attn @ V).transpose(1, 2).contiguous().view(B, T, D)
+        x = x + self.ls1(self.o_proj(attn_out))   # LayerScale on attn output
 
-        # FFN
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.ls2(self.ffn(self.norm2(x))) # LayerScale on FFN output
         return x
 
 
@@ -456,4 +469,3 @@ class SpeechVAE(nn.Module):
                                     temperature=temperature)
         recon = self.decode(z) if decode else None
         return z, mu, logvar, recon
-

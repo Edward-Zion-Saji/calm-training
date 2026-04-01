@@ -20,7 +20,9 @@ batch_size: 8                  # safe for A100 40GB with 2s clips
 grad_accumulation: 8           # effective batch = 64
 learning_rate: 8.0e-4
 disc_learning_rate: 3.0e-4
-betas: [0.8, 0.99]          # ⚠️ not stated in paper for VAE; inferred from EnCodec/DAC convention
+betas: [0.5, 0.9]             # Moshi paper (Defossez et al. 2024, Section 3.3.1): β₁=0.5, β₂=0.9
+transformer_weight_decay: 0.05  # Moshi: weight decay 5e-2 on Transformer params only
+ema_decay: 0.99               # Moshi: EMA with decay=0.99
 lr_schedule: cosine
 max_steps: 500000
 warmup_steps: 5000

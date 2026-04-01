@@ -25,13 +25,12 @@ def kl_divergence_loss(mu: torch.Tensor,
 
 def generator_adversarial_loss(fake_logits: list[torch.Tensor]) -> torch.Tensor:
     """
-    Generator adversarial loss: wants discriminator to output 1 for fake audio.
-    L_gen = mean over all discriminators of  mean((D(x̂) - 1)²)
-    fake_logits: list of discriminator output tensors for fake audio
+    Generator hinge loss — Moshi paper uses hinge (not LSGAN).
+    L_gen = mean(ReLU(1 - D(x̂)))  →  generator wants D(fake) ≥ 1
     """
     loss = 0.0
     for logit in fake_logits:
-        loss = loss + F.mse_loss(logit, torch.ones_like(logit))
+        loss = loss + F.relu(1.0 - logit).mean()
     return loss / len(fake_logits)
 
 
@@ -39,16 +38,13 @@ def discriminator_adversarial_loss(real_logits: list[torch.Tensor],
                                    fake_logits: list[torch.Tensor]
                                    ) -> torch.Tensor:
     """
-    Discriminator loss: real → 1, fake → 0
-    L_disc = 0.5 * mean((D(x)-1)² + D(x̂)²)
+    Discriminator hinge loss — Moshi paper (Audiocraft config: adv_loss=hinge).
+    L_disc = mean(ReLU(1 - D(real))) + mean(ReLU(1 + D(fake)))
     """
     loss = 0.0
     for real, fake in zip(real_logits, fake_logits):
-        loss = loss + (
-            F.mse_loss(real, torch.ones_like(real))
-            + F.mse_loss(fake, torch.zeros_like(fake))
-        )
-    return 0.5 * loss / len(real_logits)
+        loss = loss + F.relu(1.0 - real).mean() + F.relu(1.0 + fake).mean()
+    return loss / len(real_logits)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

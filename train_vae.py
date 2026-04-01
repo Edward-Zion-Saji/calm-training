@@ -137,17 +137,35 @@ def train(cfg: dict, resume_path: str | None = None,
 
     # ── Optimisers ────────────────────────────────────────────────────────────
     # Generator: VAE + distillation projection (WavLM itself is frozen)
-    gen_params = list(vae.parameters()) + list(distiller.projection.parameters())
-    opt_g = AdamW(gen_params,
-                  lr=cfg.get("learning_rate", 8e-4),
-                  betas=tuple(cfg.get("betas", [0.8, 0.99])),
-                  weight_decay=1e-2)
+    # Moshi paper: AdamW with β₁=0.5, β₂=0.9, weight decay ONLY on Transformer params
+    # "We apply weight decay only to the parameters of the Transformers, weight=5e-2"
+    transformer_params, other_params = [], []
+    for name, p in vae.named_parameters():
+        if "transformer" in name:
+            transformer_params.append(p)
+        else:
+            other_params.append(p)
+    other_params += list(distiller.projection.parameters())
 
-    # Discriminator: higher LR is typical for stable GAN training
+    gen_param_groups = [
+        {"params": transformer_params, "weight_decay": cfg.get("transformer_weight_decay", 5e-2)},
+        {"params": other_params,       "weight_decay": 0.0},
+    ]
+    betas = tuple(cfg.get("betas", [0.5, 0.9]))  # Moshi: β₁=0.5, β₂=0.9
+    opt_g = AdamW(gen_param_groups, lr=cfg.get("learning_rate", 8e-4), betas=betas)
+
+    # Discriminator uses same betas, no weight decay
     opt_d = AdamW(disc.parameters(),
                   lr=cfg.get("disc_learning_rate", 3e-4),
-                  betas=tuple(cfg.get("betas", [0.8, 0.99])),
-                  weight_decay=1e-2)
+                  betas=betas,
+                  weight_decay=0.0)
+
+    # EMA on generator weights — Moshi paper: decay=0.99
+    # torch.optim.swa_utils.AveragedModel handles EMA cleanly
+    from torch.optim.swa_utils import AveragedModel
+    ema_decay = cfg.get("ema_decay", 0.99)
+    vae_ema   = AveragedModel(vae, multi_avg_fn=lambda averaged, current, num_averaged:
+                              ema_decay * averaged + (1 - ema_decay) * current)
 
     max_steps = cfg.get("max_steps", 500_000)
     sch_g = CosineAnnealingLR(opt_g, T_max=max_steps, eta_min=1e-6)
@@ -265,9 +283,15 @@ def train(cfg: dict, resume_path: str | None = None,
                     wandb.log(breakdown, step=global_step)
 
                 # ── Checkpoint ────────────────────────────────────────────
+                # Update EMA after each optimiser step
+                vae_ema.update_parameters(vae)
+
                 if global_step % save_every == 0:
                     save_checkpoint(global_step, vae, disc,
                                     opt_g, opt_d, sch_g, sch_d, out_dir)
+                    # Also save EMA weights — use these for inference/evaluation
+                    torch.save(vae_ema.module.state_dict(),
+                               os.path.join(out_dir, f"vae_ema_{global_step:07d}.pt"))
                     print(f"\nSaved checkpoint at step {global_step}")
 
     pbar.close()
@@ -278,7 +302,11 @@ def train(cfg: dict, resume_path: str | None = None,
     # Save VAE-only weights for downstream CALM training (no discriminator)
     torch.save(vae.state_dict(),
                os.path.join(out_dir, "vae_final.pt"))
+    # EMA weights are what you should use for the CALM backbone
+    torch.save(vae_ema.module.state_dict(),
+               os.path.join(out_dir, "vae_ema_final.pt"))
     print(f"\nTraining complete. VAE saved to {out_dir}/vae_final.pt")
+    print(f"EMA weights saved to {out_dir}/vae_ema_final.pt — use these for CALM training.")
 
 
 if __name__ == "__main__":
