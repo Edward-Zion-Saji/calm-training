@@ -25,6 +25,32 @@ use the encoder to produce training targets and the decoder to synthesise audio 
 
 ---
 
+## Paper Accuracy Notes
+
+This guide is based on arXiv:2509.06926. The following table summarises exactly which values
+come directly from the paper vs. which are inferred from cited works or community convention.
+
+| Detail | Source | Status |
+|--------|--------|--------|
+| Conv strides `[6,5,4,4,4]` | Table 13 | ✅ Exact from paper |
+| Latent dim = 32 | Table 13 | ✅ Exact from paper |
+| Frame rate 12.5Hz, sample rate 24kHz | Table 13 | ✅ Exact from paper |
+| 8 Transformer layers (enc + dec) | Table 13 | ✅ Exact from paper |
+| **Transformer context = 10s (125 frames)** | Table 13 | ✅ Exact from paper |
+| Batch size 64, clip length 12s | Table 13 | ✅ Exact from paper |
+| λ_KL = 0.01 | Table 13 | ✅ Exact from paper |
+| λ_distil = 25 (WavLM, cosine similarity) | Table 13 + Sec 5.1 | ✅ Exact from paper |
+| No reconstruction loss for speech | Table 13 + Sec 4.1 | ✅ Exact from paper |
+| WavLM distilled into entire latent (not just first codebook) | Sec 5.1 | ✅ Exact from paper |
+| LR = 8×10⁻⁴, cosine schedule | Table 13 | ✅ Exact from paper |
+| Optimizer type and betas for VAE | **Not stated in paper** | ⚠️ Inferred from EnCodec/DAC: AdamW β₁=0.8, β₂=0.99 |
+| Discriminator architecture (MS-STFT, MPD, MSD) | **Not stated in paper** | ⚠️ Inferred from Evans et al. 2024 / Mimi |
+| λ_adv and λ_feat exact values | **Not stated in paper** | ⚠️ Inferred from Stable Audio Open convention |
+| WavLM layer index | **Not stated in paper** | ⚠️ Inferred: layer 6–7 from phoneme-probing literature |
+| Transformer hidden dim = 512, heads = 8, FFN = 2048 | Mimi config (HF) | ℹ️ From Mimi, architecture basis for CALM VAE |
+
+---
+
 ## 1. Overview & Architecture Blueprint
 
 ### Why a VAE and not Mimi directly?
@@ -92,7 +118,7 @@ from Mimi. Only the bottleneck is replaced.
 | Frame rate                 | 12.5 Hz                      | 1 latent frame = 80 ms                       |
 | Latent dimension           | **32**                       | Continuous, Gaussian                         |
 | Conv downsampling ratios   | `[6, 5, 4, 4, 4]`            | Product = 1920 → 24000/1920 = 12.5 Hz        |
-| Encoder Transformer layers | 8                            | Causal, sliding window = 250 frames (~20 s)  |
+| Encoder Transformer layers | 8                            | Causal, sliding window = 125 frames (10 s per Table 13) |
 | Decoder Transformer layers | 8                            | Causal                                       |
 | Transformer hidden dim     | 512                          | From Mimi config                             |
 | Transformer heads          | 8                            | Head dim = 64                                |
@@ -103,7 +129,7 @@ from Mimi. Only the bottleneck is replaced.
 | Reconstruction loss        | **None** (speech only)       | Adversarial + KL + WavLM only                |
 | WavLM distillation weight  | **25**                       | Applied to **entire** 32-dim latent          |
 | Learning rate              | 8 × 10⁻⁴                     | Cosine schedule                              |
-| Optimizer                  | AdamW β₁=0.8, β₂=0.99       |                                              |
+| Optimizer                  | Not specified for VAE in paper | Table 14 specifies AdamW β₁=0.9, β₂=0.95 for CALM backbone. VAE optimizer inferred from EnCodec/DAC convention: AdamW β₁=0.8, β₂=0.99 |
 | Model size (VAE only)      | ~20M parameters              | Encoder + Decoder (no discriminator)         |
 
 ---
@@ -119,7 +145,7 @@ CALM Speech VAE
 │   ├── EncoderBlock  (256 → 512, stride=4)
 │   ├── EncoderBlock  (512 → 512, stride=4)
 │   ├── EncoderBlock  (512 → 512, stride=4)
-│   ├── CausalTransformer  (8 layers, d=512)  long-range context
+│   ├── CausalTransformer  (8 layers, d=512, window=125 frames=10s)  long-range context
 │   └── Linear  (512 → 64)                    split into μ (32) + logvar (32)
 │
 ├── VAEBottleneck
@@ -265,14 +291,14 @@ transformer_hidden: 512
 transformer_layers: 8
 transformer_heads: 8
 transformer_ffn_dim: 2048
-transformer_sliding_window: 250       # frames (~20s at 12.5Hz)
+transformer_sliding_window: 125       # frames — 10s at 12.5Hz (paper Table 13: "Transformer context: 10s")
 
 # ── Training ───────────────────────────────────────────────────────
 batch_size: 8                  # safe for A100 40GB with 2s clips
 grad_accumulation: 8           # effective batch = 64
 learning_rate: 8.0e-4
 disc_learning_rate: 3.0e-4
-betas: [0.8, 0.99]
+betas: [0.8, 0.99]          # ⚠️ not stated in paper for VAE; inferred from EnCodec/DAC convention
 lr_schedule: cosine
 max_steps: 500000
 warmup_steps: 5000
@@ -644,7 +670,7 @@ class CausalTransformerBlock(nn.Module):
     """Single causal Transformer layer with RoPE and sliding window mask."""
 
     def __init__(self, dim: int, heads: int, ffn_dim: int,
-                 sliding_window: int = 250, dropout: float = 0.0):
+                 sliding_window: int = 125, dropout: float = 0.0):  # 10s at 12.5Hz per Table 13
         super().__init__()
         assert dim % heads == 0
         self.heads      = heads
@@ -701,7 +727,7 @@ class CausalTransformerBlock(nn.Module):
 
 class CausalTransformer(nn.Module):
     def __init__(self, dim: int, layers: int, heads: int, ffn_dim: int,
-                 sliding_window: int = 250):
+                 sliding_window: int = 125):  # 10s at 12.5Hz per paper Table 13
         super().__init__()
         self.blocks = nn.ModuleList([
             CausalTransformerBlock(dim, heads, ffn_dim, sliding_window)
@@ -777,7 +803,7 @@ class Encoder(nn.Module):
                  transformer_layers: int = 8,
                  transformer_heads: int = 8,
                  transformer_ffn: int = 2048,
-                 sliding_window: int = 250):
+                 sliding_window: int = 125):  # 10s × 12.5Hz = 125 frames — paper Table 13
         super().__init__()
         if strides is None:
             strides = [6, 5, 4, 4, 4]
@@ -826,7 +852,7 @@ class Decoder(nn.Module):
                  transformer_layers: int = 8,
                  transformer_heads: int = 8,
                  transformer_ffn: int = 2048,
-                 sliding_window: int = 250):
+                 sliding_window: int = 125):  # 10s × 12.5Hz = 125 frames — paper Table 13
         super().__init__()
         if strides is None:
             strides = [6, 5, 4, 4, 4]
@@ -980,7 +1006,7 @@ class SpeechVAE(nn.Module):
                  transformer_layers: int = 8,
                  transformer_heads: int = 8,
                  transformer_ffn: int = 2048,
-                 sliding_window: int = 250):
+                 sliding_window: int = 125):  # 10s × 12.5Hz = 125 frames — paper Table 13
         super().__init__()
         if strides is None:
             strides = [6, 5, 4, 4, 4]
@@ -1093,14 +1119,22 @@ print(f"Total VAE:  {total/1e6:.1f}M")
 ## 6. Discriminators
 
 The VAE generator is trained adversarially against a discriminator ensemble. The discriminators
-are **not saved as part of the final VAE** — they are used only during training. Three
-complementary discriminators are used, each measuring audio quality at a different granularity.
+are **not saved as part of the final VAE** — they are used only during training.
+
+> ⚠️ **Paper accuracy note:** The CALM paper (Section 4.1) **does not specify the discriminator
+> architecture**. It states `L_adv` (adversarial loss) and `L_feat` (feature matching loss) exist,
+> and cites Evans et al. 2024 (Stable Audio Open) and Mimi (Défossez et al., 2024) as the source
+> of the VAE-GAN framework. The three-discriminator setup below is **inferred** from those cited
+> works and represents best practice for 24kHz causal audio — it is NOT explicitly stated in CALM.
+
+Three complementary discriminators are used in the referenced implementations, each measuring
+audio quality at a different granularity:
 
 | Discriminator | What it captures | From |
 |---|---|---|
-| Multi-Scale STFT (MS-STFT) | Spectral artifacts across frequency resolutions | EnCodec / Mimi |
-| Multi-Period (MPD) | Periodic waveform structure (pitch, harmonics) | HiFi-GAN |
-| Multi-Scale Waveform (MSD) | Waveform shape at multiple downsampling levels | MelGAN |
+| Multi-Scale STFT (MS-STFT) | Spectral artifacts across frequency resolutions | EnCodec / Mimi (inferred) |
+| Multi-Period (MPD) | Periodic waveform structure (pitch, harmonics) | HiFi-GAN (inferred) |
+| Multi-Scale Waveform (MSD) | Waveform shape at multiple downsampling levels | MelGAN (inferred) |
 
 ---
 
@@ -1518,10 +1552,14 @@ class WavLMDistillation(nn.Module):
 
 ### Which WavLM layer to use?
 
-The paper does not specify the exact WavLM layer. Mimi uses layer 6 (0-indexed). A common
-empirical finding across phoneme-probing studies is that layers 6–9 of WavLM-Large carry the
-richest phonetic information. The config sets `wavlm_layer: 7` as a good default. You can tune
-this by checking phoneme discriminability (ABX score) after training.
+> ⚠️ **Paper accuracy note:** The CALM paper **does not specify which WavLM layer** to distil
+> from — Section 5.1 only says "we distill WavLM into the inner latent representation with a
+> cosine similarity loss." The layer choice below is **not stated in the paper**.
+
+Mimi uses layer 6 (0-indexed). A common empirical finding across phoneme-probing studies is that
+layers 6–9 of WavLM-Large carry the richest phonetic information. The config sets `wavlm_layer: 7`
+as a reasonable default. You can tune this by checking phoneme discriminability (ABX score) after
+training.
 
 ```python
 # To test multiple layers during debugging:
@@ -1550,19 +1588,24 @@ distiller = WavLMDistillation().to(device)
 
 ## 8. Loss Functions & Weights
 
-The full VAE loss from the paper (Eq. 2):
+The full VAE loss from the paper (Eq. 2 — exact equation):
 
 ```
-L_VAE = λ_t · L_t(x, x̂)            ← temporal reconstruction  [speech: 0]
-      + λ_f · L_f(x, x̂)            ← frequency reconstruction  [speech: 0]
-      + λ_adv · L_adv(x̂)           ← adversarial loss
-      + λ_feat · L_feat(x, x̂)      ← feature matching
-      + λ_KL · L_KL(μ, logvar)      ← KL divergence  [weight: 0.01]
-      + λ_distil · L_distil         ← WavLM distillation  [weight: 25]
+L_VAE = λ_t · L_t(x, x̂)            ← temporal reconstruction  [speech: λ_t = 0, Table 13: ✗]
+      + λ_f · L_f(x, x̂)            ← frequency reconstruction  [speech: λ_f = 0, Table 13: ✗]
+      + λ_adv · L_adv(x̂)           ← adversarial loss          [⚠️ exact weight NOT in paper]
+      + λ_feat · L_feat(x, x̂)      ← feature matching          [⚠️ exact weight NOT in paper]
+      + λ_KL · L_KL(μ, logvar)      ← KL divergence             [paper Table 13: λ_KL = 0.01 ✓]
+      + λ_distil · L_distil         ← WavLM distillation        [paper Table 13: λ_distil = 25 ✓]
 ```
 
 For **speech**, reconstruction losses are zero — only adversarial + KL + WavLM.
 For **music**, reconstruction losses are included (not covered in this TTS-focused guide).
+
+> ⚠️ **Paper accuracy note:** The paper only explicitly states **two** of the six loss weights:
+> `λ_KL = 0.01` and `λ_distil = 25` (Table 13). The weights for `λ_adv` and `λ_feat` are
+> **not given** in the paper. The values used in our code (`λ_adv = 1.0`, `λ_feat = 5.0`) are
+> inferred from Stable Audio Open (Evans et al. 2024) and EnCodec — the works the authors cite.
 
 ---
 
@@ -1728,13 +1771,13 @@ class VAEGeneratorLoss(nn.Module):
 
 ### Loss weight rationale
 
-| Loss | Weight | Why |
-|---|---|---|
-| `λ_KL = 0.01` | Small | Prioritise reconstruction quality; gentle Gaussian push. Increase if latent space is chaotic. |
-| `λ_adv = 1.0` | Standard | Drives perceptual realism. Lower if training is unstable early on. |
-| `λ_feat = 5.0` | High | Feature matching is the primary stability anchor — keeps generator from mode collapse. |
-| `λ_distil = 25.0` | Very high | WavLM semantics is the dominant signal for speech VAE. This is what makes the latent space useful for CALM. |
-| `λ_recon = 0.0` | Zero (speech) | Explicit waveform/spectrogram matching is counterproductive when WavLM distillation is present — WavLM already captures what matters. |
+| Loss | Weight | Source | Why |
+|---|---|---|---|
+| `λ_KL = 0.01` | Small | ✅ **Paper Table 13** | Prioritise reconstruction quality; gentle Gaussian push. |
+| `λ_adv = 1.0` | Standard | ⚠️ **Inferred** (not in paper) | Drives perceptual realism. From Stable Audio / EnCodec convention. |
+| `λ_feat = 5.0` | High | ⚠️ **Inferred** (not in paper) | Feature matching is the primary stability anchor. From Stable Audio convention. |
+| `λ_distil = 25.0` | Very high | ✅ **Paper Table 13** | WavLM semantics is the dominant signal. This is what makes the latent space useful for CALM. |
+| `λ_recon = 0.0` | Zero (speech) | ✅ **Paper Table 13 + Section 4.1** | Paper explicitly states no reconstruction loss for speech. |
 
 ---
 
