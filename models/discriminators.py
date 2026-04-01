@@ -144,10 +144,12 @@ class PeriodDiscriminator(nn.Module):
         x = x.view(B, 1, -1, self.period)   # [B, 1, T//p, p]
 
         feature_maps = []
-        for layer in self.net:
+        for layer in self.net[:-1]:   # all layers except the final logit conv
             x = layer(x)
-            if hasattr(layer, '__len__') and len(layer) > 1:
+            # Capture activation after each LeakyReLU (consistent with MSD/MSSTFTD)
+            if isinstance(layer, nn.Sequential):
                 feature_maps.append(x)
+        x = self.net[-1](x)           # final logit conv (plain nn.Conv2d)
         return x, feature_maps
 
 
@@ -227,8 +229,10 @@ class MultiScaleDiscriminator(nn.Module):
         all_logits, all_features = [], []
         x = audio
         for pool, disc in zip(self.pooling, self.discriminators):
-            x_d = pool(x)
-            logits, feats = disc(x_d)
+            # Progressive pooling: x is updated each iteration so disc[0] sees
+            # original, disc[1] sees ×2 downsampled, disc[2] sees ×4 downsampled.
+            x = pool(x)
+            logits, feats = disc(x)
             all_logits.append(logits)
             all_features.append(feats)
         return all_logits, all_features

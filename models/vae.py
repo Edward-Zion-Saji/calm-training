@@ -15,7 +15,11 @@ class CausalConv1d(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int,
                  stride: int = 1, dilation: int = 1, bias: bool = True):
         super().__init__()
+        # For strided convolutions the receptive field in the input is
+        # (kernel_size - 1) * dilation samples back. We pad exactly that many
+        # zeros on the left so that the first output frame only sees t=0.
         self.pad = (kernel_size - 1) * dilation
+        self.stride = stride
         self.conv = nn.utils.weight_norm(
             nn.Conv1d(in_ch, out_ch, kernel_size,
                       stride=stride, dilation=dilation,

@@ -80,15 +80,26 @@ def flatten_disc_outputs(disc_outputs: dict):
     """
     disc_outputs: return value of CombinedDiscriminator.forward()
       {"msstftd": (logits_list, feats_list), "mpd": ..., "msd": ...}
+
+    Each discriminator returns (logits_list, feats_list) where:
+      - logits_list is a list of tensors (one per sub-discriminator resolution)
+      - feats_list  is a list of lists   (one inner list per sub-discriminator,
+                                          each containing intermediate tensors)
+
     Returns:
-      all_logits:   flat list of logit tensors
-      all_features: list of feature-map lists (one per sub-discriminator)
+      all_logits:   flat list[Tensor]       — one per sub-discriminator
+      all_features: list[list[Tensor]]      — one inner list per sub-discriminator
     """
     all_logits   = []
     all_features = []
     for name, (logits, feats) in disc_outputs.items():
         all_logits.extend(logits)
-        all_features.extend(feats if isinstance(feats[0], list) else [feats])
+        # feats is already list[list[Tensor]] from MSSTFTD/MPD/MSD
+        # Guard against an empty feature list or flat list of tensors
+        if feats and isinstance(feats[0], list):
+            all_features.extend(feats)
+        elif feats:
+            all_features.append(feats)   # single-disc case: wrap in outer list
     return all_logits, all_features
 
 

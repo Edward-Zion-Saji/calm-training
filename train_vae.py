@@ -109,7 +109,7 @@ def train(cfg: dict, resume_path: str | None = None,
         transformer_layers = cfg.get("transformer_layers", 8),
         transformer_heads  = cfg.get("transformer_heads", 8),
         transformer_ffn    = cfg.get("transformer_ffn_dim", 2048),
-        sliding_window     = cfg.get("transformer_sliding_window", 250),
+        sliding_window     = cfg.get("transformer_sliding_window", 125),  # 10s×12.5Hz per Table 13
     ).to(device)
 
     disc = CombinedDiscriminator().to(device)
@@ -190,8 +190,12 @@ def train(cfg: dict, resume_path: str | None = None,
             real_audio = real_audio.to(device)   # [B, 1, T]
 
             # ── DISCRIMINATOR UPDATE ────────────────────────────────────────
+            # Encode+decode with no gradients for the D step — detach the
+            # reconstruction so disc sees a stopped-gradient fake sample.
+            vae.eval()  # batchnorm/dropout in eval for D step
             with torch.no_grad():
-                z, mu, logvar, fake_audio = vae(real_audio)
+                _, _, _, fake_audio = vae(real_audio)
+            vae.train()
 
             real_out = disc(real_audio.detach())
             fake_out = disc(fake_audio.detach())
@@ -200,14 +204,15 @@ def train(cfg: dict, resume_path: str | None = None,
             fake_logits, _ = flatten_disc_outputs(fake_out)
 
             d_loss = discriminator_adversarial_loss(real_logits, fake_logits)
-            d_loss = d_loss / grad_accum
-            d_loss.backward()
+            (d_loss / grad_accum).backward()
 
             # ── GENERATOR UPDATE ───────────────────────────────────────────
+            # Full forward pass again — gradients flow through VAE this time.
             z, mu, logvar, fake_audio = vae(real_audio)
 
-            # WavLM distillation — uses ORIGINAL audio, not reconstruction
-            distil_loss = distiller(real_audio, z)
+            # WavLM distillation uses mu (deterministic mean), not the noisy
+            # sample z — matches paper Section 5.1: "inner latent representation"
+            distil_loss = distiller(real_audio, mu)
 
             # Discriminator forward on fake (need gradients this time)
             fake_out  = disc(fake_audio)

@@ -94,7 +94,7 @@ def main():
         transformer_layers = cfg.get("transformer_layers", 8),
         transformer_heads  = cfg.get("transformer_heads", 8),
         transformer_ffn    = cfg.get("transformer_ffn_dim", 2048),
-        sliding_window     = cfg.get("transformer_sliding_window", 250),
+        sliding_window     = cfg.get("transformer_sliding_window", 125),  # 10s×12.5Hz per Table 13
     ).to(device)
 
     ckpt = torch.load(args.vae_ckpt, map_location=device)

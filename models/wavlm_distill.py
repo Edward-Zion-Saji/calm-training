@@ -26,6 +26,7 @@ class WavLMDistillation(nn.Module):
                  wavlm_layer: int = 7):
         super().__init__()
         self.vae_sr      = vae_sr
+        self.wavlm_sr    = self.WAVLM_SR
         self.wavlm_layer = wavlm_layer
 
         # Load and freeze WavLM
@@ -34,11 +35,12 @@ class WavLMDistillation(nn.Module):
         for p in self.wavlm.parameters():
             p.requires_grad = False
 
-        # Resample from VAE sample rate to WavLM's 16kHz
+        # torchaudio.transforms.Resample is an nn.Module — registering it here
+        # ensures it moves to the correct device with .to(device)
         self.resampler = torchaudio.transforms.Resample(vae_sr, self.WAVLM_SR)
 
         # Trainable projection: latent_dim → WavLM hidden dim
-        # This projection is the only trainable part of this module
+        # This is the only trainable part; WavLM and resampler are frozen
         self.projection = nn.Linear(latent_dim, self.WAVLM_DIM, bias=False)
 
     @torch.no_grad()
@@ -46,50 +48,58 @@ class WavLMDistillation(nn.Module):
         """
         audio:   [B, 1, T_audio]  at vae_sr (24kHz)
         returns: [B, T_wavlm_aligned, wavlm_dim]  at VAE frame rate (12.5Hz)
+
+        Note: @torch.no_grad() is correct here — WavLM is frozen and we never
+        need gradients through the teacher features.
         """
-        # Resample to 16kHz for WavLM
+        # Resample to 16kHz. resampler is an nn.Module and was moved to the
+        # correct device when WavLMDistillation.to(device) was called.
         audio_16k = self.resampler(audio.squeeze(1))   # [B, T_16k]
 
-        # Normalise to zero mean, unit variance (WavLM expects this)
+        # WavLM expects zero-mean, unit-variance input (same normalisation as
+        # during its pre-training on 16kHz speech).
         mean = audio_16k.mean(dim=-1, keepdim=True)
         std  = audio_16k.std(dim=-1, keepdim=True).clamp(min=1e-5)
         audio_16k = (audio_16k - mean) / std
 
-        # Run WavLM — extract specified hidden layer
+        # Run frozen WavLM — extract specified hidden layer.
+        # hidden_states is a tuple: index 0 = CNN feature extractor output,
+        # indices 1..25 = transformer layer outputs for WavLM-Large (24 layers).
+        # Paper says "cosine similarity loss" on the inner latent; Mimi uses
+        # layer 6 (0-indexed from Transformer, = index 7 in hidden_states tuple).
         outputs = self.wavlm(audio_16k, output_hidden_states=True)
-        # hidden_states: tuple of (n_layers+1) × [B, T_50hz, 1024]
         feats = outputs.hidden_states[self.wavlm_layer]   # [B, T_50hz, 1024]
 
-        # Downsample from 50Hz to 12.5Hz via average pooling (factor 4)
-        # channels-first for avg_pool1d
+        # Downsample from ~50Hz to 12.5Hz (factor = 4) to align with VAE latents.
         feats = feats.transpose(1, 2)                         # [B, 1024, T_50hz]
         feats = F.avg_pool1d(feats, kernel_size=self.POOL_FACTOR,
                              stride=self.POOL_FACTOR)          # [B, 1024, T_12.5hz]
         return feats.transpose(1, 2)                           # [B, T_12.5hz, 1024]
 
     def forward(self, audio: torch.Tensor,
-                vae_latents: torch.Tensor) -> torch.Tensor:
+                mu: torch.Tensor) -> torch.Tensor:
         """
-        Compute WavLM distillation loss.
+        Compute WavLM distillation loss (paper Section 5.1, cosine similarity).
 
-        audio:        [B, 1, T_audio]      — original 24kHz audio (not reconstruction)
-        vae_latents:  [B, latent_dim, T_latent]  — sampled z from VAE bottleneck
+        audio:  [B, 1, T_audio]          — original 24kHz waveform (NOT reconstruction)
+        mu:     [B, latent_dim, T_latent] — VAE encoder mean (deterministic, no noise)
+                                            Use mu, not z, so the distillation target
+                                            is not corrupted by reparameterisation noise.
 
-        Returns: scalar cosine-similarity distillation loss
+        Returns: scalar loss in [0, 2]; 0 = perfect alignment.
         """
-        # Extract teacher features (no grad)
+        # Teacher features from frozen WavLM (no gradients)
         teacher = self.extract_wavlm_features(audio)   # [B, T_lat, 1024]
 
-        # Project VAE latents to WavLM dim
-        z_t = vae_latents.transpose(1, 2)              # [B, T_lat, latent_dim]
-        student = self.projection(z_t)                  # [B, T_lat, 1024]
+        # Project mu to WavLM's hidden dim (trainable linear layer)
+        mu_t    = mu.transpose(1, 2)                   # [B, T_lat, latent_dim]
+        student = self.projection(mu_t)                 # [B, T_lat, 1024]
 
-        # Align temporal dimension (may differ by 1 frame due to rounding)
+        # Align temporal dimension — can differ by ±1 frame due to pooling rounding
         T = min(teacher.shape[1], student.shape[1])
         teacher = teacher[:, :T, :]
         student = student[:, :T, :]
 
-        # Cosine similarity loss (1 - cosine_sim → minimise)
-        # Mean over batch and time
+        # Cosine similarity loss: 1 − cos_sim (paper: "cosine similarity loss")
         loss = 1.0 - F.cosine_similarity(student, teacher, dim=-1).mean()
         return loss
