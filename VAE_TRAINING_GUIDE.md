@@ -1381,4 +1381,169 @@ print(sum(p.numel() for p in disc.parameters()) / 1e6)
 
 ---
 
-*Next section: WavLM distillation — the key quality driver for the speech VAE.*
+---
+
+## 7. WavLM Distillation
+
+This is **the most important loss** for the speech VAE and the biggest departure from a standard
+audio VAE-GAN setup. WavLM (Chen et al., 2021) is a large self-supervised speech model trained
+to predict masked speech frames. Its internal representations encode rich phonetic and semantic
+information. By forcing the VAE latents to match WavLM's representations, we ensure:
+
+1. The latent space is **semantically organised** — phonetically similar sounds cluster together
+2. The CALM backbone has an **easier prediction target** — it predicts which phoneme cluster comes
+   next, not arbitrary acoustic noise
+3. The latents encode what is being **said** (semantic) not just how it sounds (acoustic)
+
+**Key CALM paper difference from Mimi:** Mimi distils WavLM only into the *first* RVQ codebook.
+CALM extends distillation to **all 32 latent dimensions**.
+
+---
+
+### Frame rate alignment
+
+```
+WavLM input:   16kHz audio
+WavLM output:  ~50 Hz features  (1 feature per 320 samples at 16kHz)
+
+VAE latents:   12.5 Hz  (1 frame per 1920 samples at 24kHz)
+
+Ratio: 50 / 12.5 = 4
+→ average-pool WavLM features by factor 4 to align with VAE latents
+```
+
+---
+
+### models/wavlm_distill.py
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
+from transformers import WavLMModel
+
+
+class WavLMDistillation(nn.Module):
+    """
+    Frozen WavLM teacher + projection head for distilling semantic
+    representations into all VAE latent dimensions.
+
+    The projection is a simple linear layer: latent_dim → wavlm_dim.
+    It is trained alongside the VAE and learns to align the latent space
+    with WavLM's internal representations.
+    """
+
+    WAVLM_DIM    = 1024    # wavlm-large hidden size
+    WAVLM_SR     = 16_000  # WavLM only accepts 16kHz
+    WAVLM_RATE   = 50      # WavLM output frame rate (Hz) at 16kHz input
+    VAE_RATE     = 12.5    # VAE latent frame rate (Hz)
+    POOL_FACTOR  = int(WAVLM_RATE / VAE_RATE)   # = 4
+
+    def __init__(self, latent_dim: int = 32, vae_sr: int = 24_000,
+                 wavlm_model_id: str = "microsoft/wavlm-large",
+                 wavlm_layer: int = 7):
+        super().__init__()
+        self.vae_sr      = vae_sr
+        self.wavlm_layer = wavlm_layer
+
+        # Load and freeze WavLM
+        self.wavlm = WavLMModel.from_pretrained(wavlm_model_id)
+        self.wavlm.eval()
+        for p in self.wavlm.parameters():
+            p.requires_grad = False
+
+        # Resample from VAE sample rate to WavLM's 16kHz
+        self.resampler = torchaudio.transforms.Resample(vae_sr, self.WAVLM_SR)
+
+        # Trainable projection: latent_dim → WavLM hidden dim
+        # This projection is the only trainable part of this module
+        self.projection = nn.Linear(latent_dim, self.WAVLM_DIM, bias=False)
+
+    @torch.no_grad()
+    def extract_wavlm_features(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        audio:   [B, 1, T_audio]  at vae_sr (24kHz)
+        returns: [B, T_wavlm_aligned, wavlm_dim]  at VAE frame rate (12.5Hz)
+        """
+        # Resample to 16kHz for WavLM
+        audio_16k = self.resampler(audio.squeeze(1))   # [B, T_16k]
+
+        # Normalise to zero mean, unit variance (WavLM expects this)
+        mean = audio_16k.mean(dim=-1, keepdim=True)
+        std  = audio_16k.std(dim=-1, keepdim=True).clamp(min=1e-5)
+        audio_16k = (audio_16k - mean) / std
+
+        # Run WavLM — extract specified hidden layer
+        outputs = self.wavlm(audio_16k, output_hidden_states=True)
+        # hidden_states: tuple of (n_layers+1) × [B, T_50hz, 1024]
+        feats = outputs.hidden_states[self.wavlm_layer]   # [B, T_50hz, 1024]
+
+        # Downsample from 50Hz to 12.5Hz via average pooling (factor 4)
+        # channels-first for avg_pool1d
+        feats = feats.transpose(1, 2)                         # [B, 1024, T_50hz]
+        feats = F.avg_pool1d(feats, kernel_size=self.POOL_FACTOR,
+                             stride=self.POOL_FACTOR)          # [B, 1024, T_12.5hz]
+        return feats.transpose(1, 2)                           # [B, T_12.5hz, 1024]
+
+    def forward(self, audio: torch.Tensor,
+                vae_latents: torch.Tensor) -> torch.Tensor:
+        """
+        Compute WavLM distillation loss.
+
+        audio:        [B, 1, T_audio]      — original 24kHz audio (not reconstruction)
+        vae_latents:  [B, latent_dim, T_latent]  — sampled z from VAE bottleneck
+
+        Returns: scalar cosine-similarity distillation loss
+        """
+        # Extract teacher features (no grad)
+        teacher = self.extract_wavlm_features(audio)   # [B, T_lat, 1024]
+
+        # Project VAE latents to WavLM dim
+        z_t = vae_latents.transpose(1, 2)              # [B, T_lat, latent_dim]
+        student = self.projection(z_t)                  # [B, T_lat, 1024]
+
+        # Align temporal dimension (may differ by 1 frame due to rounding)
+        T = min(teacher.shape[1], student.shape[1])
+        teacher = teacher[:, :T, :]
+        student = student[:, :T, :]
+
+        # Cosine similarity loss (1 - cosine_sim → minimise)
+        # Mean over batch and time
+        loss = 1.0 - F.cosine_similarity(student, teacher, dim=-1).mean()
+        return loss
+```
+
+---
+
+### Which WavLM layer to use?
+
+The paper does not specify the exact WavLM layer. Mimi uses layer 6 (0-indexed). A common
+empirical finding across phoneme-probing studies is that layers 6–9 of WavLM-Large carry the
+richest phonetic information. The config sets `wavlm_layer: 7` as a good default. You can tune
+this by checking phoneme discriminability (ABX score) after training.
+
+```python
+# To test multiple layers during debugging:
+for layer_idx in [6, 7, 8, 9]:
+    distiller = WavLMDistillation(wavlm_layer=layer_idx)
+    loss = distiller(audio_batch, latent_batch)
+    print(f"Layer {layer_idx}: distil_loss={loss.item():.4f}")
+```
+
+---
+
+### Memory note
+
+WavLM-Large has 316M parameters. Even frozen, it occupies ~1.2 GB of VRAM in fp32. On an A100
+40GB this is fine, but load it once and keep it on GPU throughout training:
+
+```python
+# Load once at training start
+distiller = WavLMDistillation().to(device)
+# WavLM is frozen; its memory footprint is fixed, no gradients stored
+```
+
+---
+
+*Next section: assembling all loss terms with their weights.*
