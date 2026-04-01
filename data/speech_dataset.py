@@ -1,146 +1,146 @@
+"""
+data/speech_dataset.py
+
+Loads English speech from local paths on the VM:
+  - LibriTTS train-clean-360  (24kHz, ready to use)
+  - SPICOR English 2 speakers (44.1kHz, resampled on-the-fly to 24kHz)
+
+No HuggingFace downloading — reads directly from /datadrive/data/.
+"""
+
+import os
+import random
+import glob
+from pathlib import Path
+
 import torch
+import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
-from datasets import load_dataset, interleave_datasets
-import random
 
 
 TARGET_SR = 24_000
 
 
-def load_hf_speech_dataset(hf_id: str, config: str | None, split: str,
-                            streaming: bool = True):
-    """Load a HuggingFace speech dataset, returning an iterable."""
-    kwargs = dict(split=split, streaming=streaming, trust_remote_code=True)
-    if config:
-        return load_dataset(hf_id, config, **kwargs)
-    return load_dataset(hf_id, **kwargs)
-
-
-class SpeechClipDataset(Dataset):
+class LocalWavDataset(Dataset):
     """
-    Wraps a HuggingFace audio dataset.
-    - Resamples to TARGET_SR (24kHz)
-    - Returns fixed-length mono clips of `clip_samples` samples
-    - Clips too short are zero-padded; clips too long are randomly cropped
+    Loads all .wav files recursively from a directory.
+    Resamples to TARGET_SR on-the-fly if needed.
+    Returns fixed-length mono clips of clip_samples samples.
     """
 
-    def __init__(self, hf_dataset, clip_seconds: float = 2.0,
-                 target_sr: int = TARGET_SR):
-        self.data = list(hf_dataset)   # materialise for map-style Dataset
+    def __init__(self, root: str, clip_seconds: float = 2.0,
+                 target_sr: int = TARGET_SR, orig_sr: int | None = None):
         self.clip_samples = int(clip_seconds * target_sr)
-        self.target_sr = target_sr
-        self._resamplers: dict[int, T.Resample] = {}
+        self.target_sr    = target_sr
+        self.orig_sr      = orig_sr   # if known ahead of time, skip torchaudio.info
 
-    def _get_resampler(self, orig_sr: int) -> T.Resample:
-        if orig_sr not in self._resamplers:
-            self._resamplers[orig_sr] = T.Resample(orig_sr, self.target_sr)
-        return self._resamplers[orig_sr]
+        self.files = sorted(glob.glob(os.path.join(root, "**", "*.wav"),
+                                      recursive=True))
+        if not self.files:
+            raise ValueError(f"No .wav files found under {root}")
+
+        print(f"  {Path(root).name}: {len(self.files):,} files")
+
+        # Build resampler once if orig_sr is fixed
+        self._resampler = None
+        if orig_sr is not None and orig_sr != target_sr:
+            self._resampler = T.Resample(orig_sr, target_sr)
 
     def __len__(self):
-        return len(self.data)
+        return len(self.files)
 
-    def __getitem__(self, idx):
-        item = self.data[idx]
-        audio_dict = item["audio"]
-        waveform = torch.tensor(audio_dict["array"], dtype=torch.float32)
-        orig_sr   = audio_dict["sampling_rate"]
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        path = self.files[idx]
 
-        # Ensure 1D (mono)
-        if waveform.ndim == 2:
-            waveform = waveform.mean(0)
+        waveform, sr = torchaudio.load(path)
 
-        # Resample if needed
-        if orig_sr != self.target_sr:
-            waveform = self._get_resampler(orig_sr)(waveform)
+        # Mono
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(0, keepdim=True)
 
-        # Normalise amplitude to [-1, 1]
+        # Resample
+        if sr != self.target_sr:
+            if self._resampler is not None:
+                waveform = self._resampler(waveform)
+            else:
+                waveform = T.Resample(sr, self.target_sr)(waveform)
+
+        waveform = waveform.squeeze(0)   # [T]
+
+        # Normalise amplitude
         peak = waveform.abs().max()
-        if peak > 0:
-            waveform = waveform / peak.clamp(min=1.0)
+        if peak > 1e-6:
+            waveform = waveform / peak
 
-        # Crop / pad to fixed length
-        if waveform.shape[0] >= self.clip_samples:
-            start = random.randint(0, waveform.shape[0] - self.clip_samples)
+        # Crop or pad to fixed length
+        T_audio = waveform.shape[0]
+        if T_audio >= self.clip_samples:
+            start = random.randint(0, T_audio - self.clip_samples)
             waveform = waveform[start: start + self.clip_samples]
         else:
-            pad = self.clip_samples - waveform.shape[0]
-            waveform = torch.nn.functional.pad(waveform, (0, pad))
+            waveform = F.pad(waveform, (0, self.clip_samples - T_audio))
 
         return waveform.unsqueeze(0)   # [1, T]
 
 
-class StreamingSpeechDataset(torch.utils.data.IterableDataset):
-    """
-    Streaming version for very large datasets (e.g. Emilia 140k h).
-    Does NOT require materialising the entire dataset into memory.
-    """
-
-    def __init__(self, hf_dataset, clip_seconds: float = 2.0,
-                 target_sr: int = TARGET_SR, buffer_size: int = 1000):
-        self.dataset = hf_dataset.shuffle(seed=42, buffer_size=buffer_size)
-        self.clip_samples = int(clip_seconds * target_sr)
-        self.target_sr = target_sr
-
-    def __iter__(self):
-        for item in self.dataset:
-            audio_dict = item["audio"]
-            waveform = torch.tensor(audio_dict["array"], dtype=torch.float32)
-            orig_sr   = audio_dict["sampling_rate"]
-
-            if waveform.ndim == 2:
-                waveform = waveform.mean(0)
-
-            if orig_sr != self.target_sr:
-                resampler = T.Resample(orig_sr, self.target_sr)
-                waveform   = resampler(waveform)
-
-            peak = waveform.abs().max()
-            if peak > 0:
-                waveform = waveform / peak.clamp(min=1.0)
-
-            # Yield multiple non-overlapping clips from one recording
-            n_clips = waveform.shape[0] // self.clip_samples
-            for i in range(max(n_clips, 1)):
-                start = i * self.clip_samples
-                clip  = waveform[start: start + self.clip_samples]
-                if clip.shape[0] < self.clip_samples:
-                    clip = torch.nn.functional.pad(
-                        clip, (0, self.clip_samples - clip.shape[0]))
-                yield clip.unsqueeze(0)   # [1, T]
-
-
 def build_dataloader(cfg: dict, num_workers: int = 4) -> DataLoader:
     """
-    Build a DataLoader from one or more HuggingFace datasets.
-    Uses streaming for datasets > 1000h.
+    Builds a DataLoader from local English speech datasets.
+    Only uses what is confirmed present on /datadrive/data/.
     """
     clip_seconds = cfg.get("clip_seconds", 2.0)
+    batch_size   = cfg.get("batch_size", 8)
 
-    # LibriTTS-R — map-style (fits in memory at ~200GB)
-    libritts = load_hf_speech_dataset(
-        "mythicinfinity/libritts_r", "all",
-        "train.clean.360+train.clean.100+train.other.500",
-        streaming=False
+    datasets = []
+
+    # ── LibriTTS train-clean-360  (24kHz, no resampling needed) ──────────────
+    libritts_root = cfg.get(
+        "libritts_root",
+        "/datadrive/data/libri_tts/LibriTTS/train-clean-360"
     )
-    ds_libritts = SpeechClipDataset(libritts, clip_seconds=clip_seconds)
+    if os.path.exists(libritts_root):
+        print("Loading LibriTTS train-clean-360...")
+        datasets.append(LocalWavDataset(
+            root        = libritts_root,
+            clip_seconds = clip_seconds,
+            target_sr   = TARGET_SR,
+            orig_sr     = 24_000,   # already 24kHz — skip torchaudio.info call
+        ))
+    else:
+        print(f"WARNING: LibriTTS not found at {libritts_root}")
 
-    # Emilia YODAS English — streaming (too large to materialise)
-    emilia_raw = load_hf_speech_dataset(
-        "amphion/Emilia-Dataset", None, "train", streaming=True
+    # ── SPICOR English (44.1kHz → resample to 24kHz) ─────────────────────────
+    spicor_root = cfg.get(
+        "spicor_root",
+        "/datadrive/data/spicor/IISc_SPICOR_Data"
     )
-    ds_emilia = StreamingSpeechDataset(emilia_raw, clip_seconds=clip_seconds)
+    if os.path.exists(spicor_root):
+        print("Loading SPICOR English...")
+        datasets.append(LocalWavDataset(
+            root        = spicor_root,
+            clip_seconds = clip_seconds,
+            target_sr   = TARGET_SR,
+            orig_sr     = 44_100,   # all SPICOR files are 44.1kHz
+        ))
+    else:
+        print(f"WARNING: SPICOR not found at {spicor_root}")
 
-    # Combine with ConcatDataset for map-style; for mixed map+iterable,
-    # use a weighted interleaved approach via HuggingFace interleave_datasets.
-    # Simple approach: just use LibriTTS-R for initial training
+    if not datasets:
+        raise RuntimeError("No datasets found. Check libritts_root and spicor_root in config.")
+
+    combined = ConcatDataset(datasets)
+    total_clips = len(combined)
+    total_hours = total_clips * clip_seconds / 3600
+    print(f"Total: {total_clips:,} clips  (~{total_hours:.0f}h at {clip_seconds}s each)")
+
     return DataLoader(
-        ds_libritts,
-        batch_size=cfg.get("batch_size", 8),
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=True,
+        combined,
+        batch_size       = batch_size,
+        shuffle          = True,
+        num_workers      = num_workers,
+        pin_memory       = True,
+        drop_last        = True,
+        persistent_workers = num_workers > 0,
     )
